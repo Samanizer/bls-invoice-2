@@ -1,0 +1,45 @@
+# docker-compose.yml — BLS Invoice application
+#
+# Services:
+#   backend  — FastAPI + SQLite, exposes port 8000
+#   frontend — React SPA served by nginx, exposes port 80
+#
+# Data persistence:
+#   The SQLite database and uploaded logo are stored in ./data on the host.
+#   This directory is mounted into the backend container at /app/data.
+#
+# Deploy:
+#   docker compose up -d --build
+#
+# Access:
+#   http://localhost      (or http://localhost:80)  → web app
+#   http://localhost:8000 → API (development/debugging)
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bls-backend
+    environment:
+      - DB_PATH=/app/data/invoice.db
+      - LOGO_DIR=/app/data/
+      - SECRET_KEY=change-me-in-production-please
+      - TOKEN_EXPIRE_MINUTES=480
+    volumes:
+      - ./data:/app/data           # Persist SQLite DB and logo across restarts
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: bls-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
