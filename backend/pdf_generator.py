@@ -1,392 +1,315 @@
 """
 pdf_generator.py - PDF invoice generator for the BLS Invoice application.
-Uses ReportLab to produce a PDF that exactly matches the Invoice_Sample.pdf layout:
-  - Company header (logo left, company info right)
-  - Invoice number/date bar
-  - Customer block with type tag
-  - Details grid (Destination, Currency, Payment, Shipping, Reference)
-  - Line items table
-  - Notes text
-  - Bank details box (bottom-left) and totals section (bottom-right)
-  - Page number
+
+The design follows the Invoice_Sample.pdf "pre-printed form" aesthetic: the
+labels read like a typewriter form's printed captions (bold Courier) and the
+customer / item / financial data reads like it was typed into the form (plain
+Courier). The top half (letterhead, invoice bar, customer block, details grid)
+matches the reference sample coordinate-for-coordinate; the lower half has been
+refined for a more professional look:
+
+  - Items table now carries a Unit Price column (Item | Description | Quantity |
+    Unit Price | Amount) with a softly shaded header band and a smaller row font.
+  - Bank Details and the Goods/Freight/Invoice-Total summary sit side-by-side in
+    matching boxes; long bank lines wrap so they never overflow their box.
+  - Totals values are baseline-aligned with their labels (the sample's values
+    floated off their captions); the Invoice Total row is highlighted.
+  - The page number sits in a proper centred footer.
+
+Fonts: the sample's Arial/Calibri (sans) and Courier New (monospace) map to the
+ReportLab base-14 Helvetica and Courier families.
 """
 
 import os
 import io
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph
-from reportlab.lib.enums import TA_LEFT
 
 PAGE_W, PAGE_H = A4          # 595.27 × 841.89 pt
-L_MARGIN = 40                # left margin
-R_MARGIN = 40                # right margin
-BODY_W = PAGE_W - L_MARGIN - R_MARGIN   # usable width
 
-# ── Font helpers ──────────────────────────────────────────────────────────────
+# ── Logo ──────────────────────────────────────────────────────────────────────
+# Default company logo shown top-left of the invoice. To change the logo, either
+# replace this file or point DEFAULT_LOGO_PATH at another image. A logo uploaded
+# through the app (Settings → logo_path) still takes precedence over this default.
+DEFAULT_LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
 
-FONT_NORMAL = "Helvetica"
-FONT_BOLD   = "Helvetica-Bold"
-FONT_MONO   = "Courier"
-FONT_MONO_B = "Courier-Bold"
+# Placement of the logo (points, origin bottom-left). The image is scaled to fit
+# inside this box while preserving its aspect ratio.
+LOGO_X, LOGO_Y = 42, 772
+LOGO_W, LOGO_H = 130, 47
 
-# ── Color palette ─────────────────────────────────────────────────────────────
+# ── Fonts ─────────────────────────────────────────────────────────────────────
+SANS    = "Helvetica"
+SANS_B  = "Helvetica-Bold"
+MONO    = "Courier"          # the "typed" data
+MONO_B  = "Courier-Bold"     # the "pre-printed" form captions
 
-GRAY_BAR   = colors.HexColor("#E8E8E8")   # Invoice number bar background
-DARK_BOX   = colors.HexColor("#1e3a8a")   # Invoice total highlight — deep Bluelight blue
-LIGHT_BOX  = colors.HexColor("#F5F5F5")   # Payment box background
-BORDER_CLR = colors.HexColor("#555555")   # Table/box borders
-
-
-# ── Utility drawing helpers ───────────────────────────────────────────────────
-
-def _line(c, x1, y1, x2, y2, width=0.5, color=BORDER_CLR):
-    """Draw a horizontal or vertical line."""
-    c.setStrokeColor(color)
-    c.setLineWidth(width)
-    c.line(x1, y1, x2, y2)
+# ── Colours ───────────────────────────────────────────────────────────────────
+GRAY_BAR   = colors.Color(0.847, 0.847, 0.847)   # invoice number bar   (#D8D8D8)
+HEADER_BG  = colors.Color(0.93, 0.93, 0.93)      # table header shading  (#EDEDED)
+LIGHT_BLUE = colors.Color(0.706, 0.78, 0.906)    # invoice-total highlight (#B4C7E7)
+HAIRLINE   = colors.Color(0.45, 0.45, 0.45)      # thin internal rules
+BLACK      = colors.black
 
 
-def _rect(c, x, y, w, h, fill_color=None, stroke_color=BORDER_CLR, line_width=0.5):
-    """Draw a rectangle, optionally filled."""
-    c.setLineWidth(line_width)
-    c.setStrokeColor(stroke_color)
-    if fill_color:
-        c.setFillColor(fill_color)
-        c.rect(x, y, w, h, fill=1)
-        c.setFillColor(colors.black)
-    else:
-        c.rect(x, y, w, h, fill=0)
+# ── Primitive drawing helpers ─────────────────────────────────────────────────
 
-
-def _text(c, x, y, txt, font=FONT_NORMAL, size=9, color=colors.black):
-    """Draw a single text string at (x, y)."""
+def _text(c, x, y, txt, font=MONO, size=9, color=BLACK):
+    """Draw a left-aligned string at (x, y)."""
     c.setFont(font, size)
     c.setFillColor(color)
     c.drawString(x, y, str(txt))
 
 
-def _text_right(c, x, y, txt, font=FONT_NORMAL, size=9, color=colors.black):
-    """Draw text right-aligned to x."""
+def _text_right(c, x, y, txt, font=MONO, size=9, color=BLACK):
+    """Draw a right-aligned string ending at x."""
     c.setFont(font, size)
     c.setFillColor(color)
     c.drawRightString(x, y, str(txt))
 
 
-def _wrap_text(c, x, y, txt, font, size, max_width):
-    """
-    Draw text that may wrap onto multiple lines.
-    Returns the y position after the last line drawn.
-    Each line descends by (size + 2) points.
-    """
-    c.setFont(font, size)
-    c.setFillColor(colors.black)
-    words = txt.split()
-    line = ""
-    line_h = size + 2
-    for word in words:
-        test = f"{line} {word}".strip()
-        if c.stringWidth(test, font, size) <= max_width:
-            line = test
+def _line(c, x1, y1, x2, y2, width=0.75, color=BLACK):
+    """Stroke a line."""
+    c.setStrokeColor(color)
+    c.setLineWidth(width)
+    c.line(x1, y1, x2, y2)
+
+
+def _rect(c, x, y, w, h, fill=None, stroke=BLACK, width=0.75):
+    """Draw a rectangle: optional fill, optional stroke."""
+    if fill is not None:
+        c.setFillColor(fill)
+        c.rect(x, y, w, h, fill=1, stroke=0)
+    if stroke is not None:
+        c.setStrokeColor(stroke)
+        c.setLineWidth(width)
+        c.rect(x, y, w, h, fill=0, stroke=1)
+
+
+def _wrap(c, text, font, size, max_w):
+    """Greedy word-wrap; returns a list of lines that each fit within max_w."""
+    lines, cur = [], ""
+    for word in str(text).split():
+        trial = (cur + " " + word).strip()
+        if c.stringWidth(trial, font, size) <= max_w or not cur:
+            cur = trial
         else:
-            c.drawString(x, y, line)
-            y -= line_h
-            line = word
-    if line:
-        c.drawString(x, y, line)
-        y -= line_h
-    return y
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
 
 
 # ── Section renderers ─────────────────────────────────────────────────────────
 
 def _draw_header(c, settings, logo_path):
-    """
-    Draw the company logo (top-left) and company details (top-right).
-    Returns the y-coordinate after the header.
-    """
-    top_y = PAGE_H - L_MARGIN
-
-    # Logo area — draw image if available, otherwise text placeholder
-    logo_box_w = 160
-    logo_box_h = 70
-    if logo_path and os.path.exists(logo_path):
+    """Company logo (top-left) and company details block (right, left-aligned)."""
+    # Prefer a logo uploaded via the app; otherwise fall back to the bundled one.
+    if not (logo_path and os.path.exists(logo_path)):
+        logo_path = DEFAULT_LOGO_PATH
+    if os.path.exists(logo_path):
         try:
-            c.drawImage(
-                logo_path,
-                L_MARGIN, top_y - logo_box_h,
-                width=logo_box_w, height=logo_box_h,
-                preserveAspectRatio=True, anchor="c"
-            )
+            c.drawImage(logo_path, LOGO_X, LOGO_Y, width=LOGO_W, height=LOGO_H,
+                        preserveAspectRatio=True, anchor="nw", mask="auto")
         except Exception:
-            pass  # silently skip if image can't be loaded
+            pass  # silently skip an unreadable image
 
-    # Company info block — right-aligned to page right margin
-    right_x = PAGE_W - R_MARGIN
-    cy = top_y - 8
-
-    company_lines = [
-        (settings.get("company_name", "BLUELIGHT FZCO"), FONT_BOLD, 11),
-        (settings.get("company_address_1", "P.O. Box 377266"), FONT_NORMAL, 9),
-        (settings.get("company_address_2", "Dubai, UAE"), FONT_NORMAL, 9),
-        (f"License No: {settings.get('company_license', '')}", FONT_NORMAL, 8),
-        (f"Tel: {settings.get('company_tel', '')}", FONT_NORMAL, 8),
-        (settings.get("company_email", ""), FONT_NORMAL, 8),
+    bx = 397.57
+    lines = [
+        (settings.get("company_name", "BLUELIGHT FZCO"),        SANS_B, 819.7),
+        (settings.get("company_address_1", "P.O. Box 377266"),  SANS,   810.4),
+        (settings.get("company_address_2", "Dubai, UAE"),       SANS,   801.2),
+        (f"License No: {settings.get('company_license', '')}",  SANS,   791.9),
+        (f"Tel: {settings.get('company_tel', '')}",             SANS,   782.7),
+        (settings.get("company_email", ""),                     SANS,   773.4),
     ]
-    for txt, font, size in company_lines:
-        if txt.strip():
-            _text_right(c, right_x, cy, txt, font, size)
-            cy -= (size + 3)
-
-    return top_y - logo_box_h - 8   # y below header
+    for txt, font, y in lines:
+        if str(txt).strip():
+            _text(c, bx, y, txt, font, 7)
 
 
-def _draw_invoice_bar(c, invoice_number, invoice_date, y):
-    """
-    Draw the gray 'INVOICE | No: xxx | Date: xxx' bar.
-    'INVOICE', 'No:' and 'Date:' labels are bold; values are normal weight.
-    Returns y below the bar.
-    """
-    bar_h = 24
-    _rect(c, L_MARGIN, y - bar_h, BODY_W, bar_h, fill_color=GRAY_BAR, line_width=0.3)
+def _draw_invoice_bar(c, invoice_number, invoice_date):
+    """Grey bar with the pre-printed INVOICE / No: / Date: captions."""
+    _rect(c, 31.5, 739.85, 536.25, 24.75, fill=GRAY_BAR, stroke=BLACK, width=0.75)
 
-    bar_mid_y = y - bar_h + 7   # vertical centre of text in bar
-
-    # "INVOICE" label — bold, far left
-    _text(c, L_MARGIN + 6, bar_mid_y, "INVOICE", FONT_BOLD, 10)
-
-    # "No:" bold + invoice number normal — centred in the bar
-    mid_x = PAGE_W / 2
-    _text(c, mid_x - 60, bar_mid_y, "No:", FONT_BOLD, 9)
-    _text(c, mid_x - 40, bar_mid_y, invoice_number, FONT_NORMAL, 9)
-
-    # "Date:" bold + date value normal — right-aligned as one combined unit.
-    # Compute total width so the phrase sits flush to the right margin.
-    label_part = "Date:  "
-    total_date_w = (c.stringWidth(label_part, FONT_BOLD, 9) +
-                    c.stringWidth(invoice_date, FONT_NORMAL, 9))
-    date_x = PAGE_W - R_MARGIN - 6 - total_date_w
-    _text(c, date_x, bar_mid_y, "Date:", FONT_BOLD, 9)
-    _text(c, date_x + c.stringWidth(label_part, FONT_BOLD, 9),
-          bar_mid_y, invoice_date, FONT_NORMAL, 9)
-
-    return y - bar_h - 10
+    y = 747.5
+    _text(c, 38.7,  y, "INVOICE", MONO_B, 9)
+    _text(c, 254.8, y, "No:",   MONO_B, 9)
+    _text(c, 281.8, y, invoice_number, MONO, 9)
+    _text(c, 434.8, y, "Date:", MONO_B, 9)
+    _text(c, 467.2, y, invoice_date, MONO, 9)
 
 
-def _draw_customer(c, customer, customer_type, y):
-    """
-    Draw the customer block. Returns y below the section.
-    """
-    _text(c, L_MARGIN, y, "Customer:", FONT_BOLD, 9)
-    y -= 14
+def _draw_customer(c, customer, customer_type):
+    """Customer label, name (uppercased), address and the type tag on the right."""
+    _text(c, 72, 707.7, "Customer:", MONO_B, 9)
 
-    name_lines = (customer.name or "").upper().split("\n")
-    for ln in name_lines:
-        _text(c, L_MARGIN + 20, y, ln, FONT_BOLD, 11)
+    y = 693.8
+    for ln in (customer.name or "").upper().split("\n"):
+        _text(c, 108, y, ln, MONO_B, 10)   # typed (bold Courier)
         y -= 14
+    for ln in (customer.address or "").split("\n"):
+        _text(c, 108, y, ln, MONO, 9)      # typed (Courier)
+        y -= 13
 
-    addr_lines = (customer.address or "").split("\n")
-    for ln in addr_lines:
-        _text(c, L_MARGIN + 20, y, ln, FONT_NORMAL, 9)
-        y -= 12
-
-    # Customer type label on the right (e.g. "EXPORT")
     if customer_type:
-        _text(c, PAGE_W / 2, y + len(addr_lines) * 12 + 14, customer_type, FONT_NORMAL, 9)
-
-    return y - 6
+        _text(c, 396.1, 693.8, customer_type, MONO, 9)
 
 
-def _draw_details_grid(c, invoice, y):
-    """
-    Draw the 3-column details grid:
-      Left  — Destination / Shipping Method
-      Middle — Invoice Currency / Ref/Proforma
-      Right  — Payment (boxed)
-    Returns y below the section.
-    """
-    col1_x = L_MARGIN
-    col2_x = L_MARGIN + BODY_W * 0.35
-    col3_x = L_MARGIN + BODY_W * 0.68
+def _draw_details_grid(c, invoice):
+    """Three-column details grid with the boxed Payment cell on the right."""
+    col1, col2, col3 = 72, 252.1, 432.1
 
-    row_h = 13
-    box_top = y
-    box_bot = y - 70
+    _rect(c, 417.75, 595.8, 141.0, 54.75, fill=None, stroke=BLACK, width=0.75)
 
-    # Payment box (right column) ← draw first so it appears behind text
-    pay_box_w = PAGE_W - R_MARGIN - col3_x
-    _rect(c, col3_x - 4, box_bot, pay_box_w + 4, box_top - box_bot,
-          stroke_color=BORDER_CLR, line_width=0.6)
+    _text(c, col1, 628.0, "Destination:",      MONO_B, 9)
+    _text(c, col2, 628.0, "Invoice Currency:", MONO_B, 9)
+    _text(c, col3, 628.0, "Payment:",          MONO_B, 9)
+    _text(c, col1, 616.3, invoice.destination or "",      MONO, 9)
+    _text(c, col2, 616.3, invoice.currency or "USD",      MONO, 9)
+    _text(c, col3, 616.3, invoice.payment_method or "TT", MONO, 9)
 
-    # Left column
-    _text(c, col1_x, y - row_h, "Destination:", FONT_BOLD, 9)
-    _text(c, col1_x, y - row_h * 2, invoice.destination or "", FONT_MONO, 9)
-    _text(c, col1_x, y - row_h * 3.5, "Shipping Method:", FONT_BOLD, 9)
-    _text(c, col1_x, y - row_h * 4.5, invoice.shipping_method or "N/A", FONT_MONO, 9)
-
-    # Middle column
-    _text(c, col2_x, y - row_h, "Invoice Currency:", FONT_BOLD, 9)
-    _text(c, col2_x, y - row_h * 2, invoice.currency or "USD", FONT_MONO, 9)
-    _text(c, col2_x, y - row_h * 3.5, "Ref / Proforma:", FONT_BOLD, 9)
-    _text(c, col2_x, y - row_h * 4.5, invoice.reference or "", FONT_MONO, 9)
-
-    # Right column (inside box)
-    _text(c, col3_x, y - row_h, "Payment:", FONT_BOLD, 9)
-    _text(c, col3_x, y - row_h * 2, invoice.payment_method or "TT", FONT_MONO, 9)
-
-    return box_bot - 12
+    _text(c, col1, 604.6, "Shipping Method:", MONO_B, 9)
+    _text(c, col2, 604.6, "Ref / Proforma:",  MONO_B, 9)
+    _text(c, col1, 592.9, invoice.shipping_method or "N/A", MONO, 9)
+    _text(c, col2, 592.9, invoice.reference or "",          MONO, 9)
 
 
-def _draw_items_table(c, line_items, y):
-    """
-    Draw the items table (header + rows).
-    Columns: Item | Description | Quantity | Amount (USD)
-    Quantity and Amount columns are both right-aligned so narrow values like "1"
-    sit directly under their column headers.
-    Returns y below the last row.
-    """
-    col_item_x    = L_MARGIN               # Item code — left-aligned
-    col_desc_x    = L_MARGIN + 90          # Description — left-aligned
-    col_qty_rx    = PAGE_W - R_MARGIN - 95 # Quantity — RIGHT-align reference point
-    col_amt_x     = PAGE_W - R_MARGIN      # Amount — RIGHT-align reference point
+# Items table geometry (right edges for the numeric columns)
+_ITEM_X  = 72
+_DESC_X  = 140
+_QTY_RX  = 372
+_PRICE_RX = 466
+_AMT_RX  = 553
+_TBL_L, _TBL_R = 42, 558.75
 
-    row_h     = 13
-    font_size = 9
-    line_h    = font_size + 2              # proper baseline-to-baseline distance
 
-    # ── Separator line above headers ────────────────────────────────────────
-    _line(c, L_MARGIN, y, PAGE_W - R_MARGIN, y, width=0.8)
-    y -= (font_size + 3)   # drop to header baseline
+def _draw_items_table(c, line_items):
+    """Items table: shaded header band, captions, and the flowing typed rows."""
+    top_rule, bot_rule = 580.03, 543.14
 
-    # ── Column headers (row 1) ───────────────────────────────────────────────
-    header_y = y
-    _text(c, col_item_x, header_y, "Item",        FONT_BOLD, font_size)
-    _text(c, col_desc_x, header_y, "Description", FONT_BOLD, font_size)
-    _text_right(c, col_qty_rx, header_y, "Quantity",    FONT_BOLD, font_size)
-    _text_right(c, col_amt_x,  header_y, "Amount",      FONT_BOLD, font_size)
+    # Shaded header band between the two rules
+    _rect(c, _TBL_L, bot_rule, _TBL_R - _TBL_L, top_rule - bot_rule,
+          fill=HEADER_BG, stroke=None)
+    _line(c, _TBL_L, top_rule, _TBL_R, top_rule, width=0.75)
+    _line(c, _TBL_L, bot_rule, _TBL_R, bot_rule, width=0.75)
 
-    # ── Column headers (row 2) — only Amount has a second line "(USD)" ───────
-    header_y2 = header_y - line_h
-    _text_right(c, col_amt_x, header_y2, "(USD)", FONT_BOLD, font_size)
+    # Column captions (pre-printed form headings)
+    _text(c, _ITEM_X,   558.5, "Item",        MONO_B, 8)
+    _text(c, _DESC_X,   558.5, "Description", MONO_B, 8)
+    _text_right(c, _QTY_RX,   558.5, "Quantity",   MONO_B, 8)
+    _text_right(c, _PRICE_RX, 558.5, "Unit Price", MONO_B, 8)
+    _text_right(c, _AMT_RX,   558.5, "Amount",     MONO_B, 8)
+    _text_right(c, _AMT_RX,   548.1, "(USD)",      MONO_B, 8)
 
-    # ── Separator line below headers (below both header rows) ────────────────
-    y = header_y2 - (font_size + 3)
-    _line(c, L_MARGIN, y, PAGE_W - R_MARGIN, y, width=0.8)
-    y -= row_h + 2
-
-    # ── Data rows ────────────────────────────────────────────────────────────
+    # Typed data rows — smaller font, uniform line height
+    size, line_h = 7, 9.6
+    y = 516.8
     for item in line_items:
         desc_lines = (item.description or "").split("\n")
-        _text(c, col_item_x, y, item.item_code or "", FONT_MONO, font_size)
-        _text(c, col_desc_x, y, desc_lines[0],         FONT_MONO, font_size)
-        _text_right(c, col_qty_rx, y, f"{item.quantity:g}",    FONT_MONO, font_size)
-        _text_right(c, col_amt_x,  y, f"{item.amount:,.2f}",   FONT_MONO, font_size)
-        y -= row_h
-        # Additional description lines
-        for extra_line in desc_lines[1:]:
-            _text(c, col_desc_x, y, extra_line, FONT_MONO, font_size)
-            y -= row_h
+        unit_price = getattr(item, "unit_price", None)
+        if unit_price is None and item.quantity:
+            unit_price = item.amount / item.quantity
+        _text(c, _ITEM_X, y, item.item_code or "", MONO, size)
+        _text(c, _DESC_X, y, desc_lines[0] if desc_lines else "", MONO, size)
+        _text_right(c, _QTY_RX,   y, f"{item.quantity:g}",        MONO, size)
+        _text_right(c, _PRICE_RX, y, f"{(unit_price or 0):,.2f}", MONO, size)
+        _text_right(c, _AMT_RX,   y, f"{item.amount:,.2f}",       MONO, size)
+        y -= line_h
+        for extra in desc_lines[1:]:
+            _text(c, _DESC_X, y, extra, MONO, size)
+            y -= line_h
 
-    return y - 6
 
-
-def _draw_notes(c, notes, y):
-    """Draw the notes/disclaimer text. Returns y below it."""
+def _draw_notes(c, notes):
+    """Disclaimer / notes, in the band just above the financial summary."""
     if notes:
-        _text(c, L_MARGIN + 20, y, notes, FONT_MONO, 8)
-        y -= 14
-    return y
+        y = 224
+        for ln in _wrap(c, notes, MONO, 8, _TBL_R - _ITEM_X):
+            _text(c, _ITEM_X, y, ln, MONO, 8)
+            y -= 11
 
 
-def _draw_footer(c, invoice, settings, totals_y):
-    """
-    Draw the combined footer:
-      Left half  — Bank Details box
-      Right half — Goods Total / Freight / Invoice Total
-    totals_y is the TOP of the footer area.
-    """
-    footer_h = 120
-    footer_top    = totals_y
-    footer_bottom = totals_y - footer_h
+# Bottom summary band — Bank box (left) and Totals box (right), side by side
+_BAND_TOP, _BAND_BOT = 206, 78
+_BANK_X, _BANK_W = 72, 258
+_TOT_X,  _TOT_W  = 345, 214
 
-    # ── Bank Details box ──────────────────────────────────────────────────
-    bank_box_w = BODY_W * 0.55
-    _rect(c, L_MARGIN, footer_bottom, bank_box_w, footer_h,
-          stroke_color=BORDER_CLR, line_width=0.6)
 
-    bx = L_MARGIN + 6
-    by = footer_top - 14
-    _text(c, bx, by, "Bank Details:", FONT_BOLD, 9)
-    by -= 12
-    bank_fields = [
-        f"A/C Name: {settings.get('bank_ac_name', '')}",
-        f"A/C Number: {settings.get('bank_ac_number', '')}",
-        f"IBAN: {settings.get('bank_iban', '')}",
-        f"Bank: {settings.get('bank_name', '')}",
-        f"Swift: {settings.get('bank_swift', '')}",
+def _draw_bank_box(c, settings):
+    """Bank Details box (lower-left); long values wrap to stay inside the box."""
+    h = _BAND_TOP - _BAND_BOT
+    _rect(c, _BANK_X, _BAND_BOT, _BANK_W, h, fill=colors.white, stroke=BLACK, width=0.75)
+
+    x = _BANK_X + 8
+    max_w = _BANK_W - 16
+    _text(c, x, _BAND_TOP - 17, "Bank Details:", SANS_B, 9)
+
+    fields = [
+        ("A/C Name:",   settings.get("bank_ac_name", ""),   False),
+        ("A/C Number:", settings.get("bank_ac_number", ""), False),
+        ("IBAN:",       settings.get("bank_iban", ""),      True),   # value bold
+        ("Bank:",       settings.get("bank_name", ""),      False),
+        ("Swift:",      settings.get("bank_swift", ""),     False),
     ]
-    for i, field in enumerate(bank_fields):
-        # Bold IBAN line
-        font = FONT_BOLD if "IBAN:" in field else FONT_NORMAL
-        _text(c, bx, by, field, font, 8)
-        by -= 11
+    y = _BAND_TOP - 32
+    size, line_h = 8.5, 11.5
+    for label, value, value_bold in fields:
+        vfont = SANS_B if value_bold else SANS
+        _text(c, x, y, label, SANS_B, size)
+        label_w = c.stringWidth(label + " ", SANS_B, size)
+        first = True
+        for ln in _wrap(c, value, vfont, size, max_w - label_w):
+            _text(c, x + (label_w if first else 0), y, ln, vfont, size)
+            y -= line_h
+            first = False
+        if first:                     # empty value: still advance one line
+            y -= line_h
 
-    # ── Totals section (right side) ───────────────────────────────────────
-    tot_x      = L_MARGIN + bank_box_w + 4
-    tot_right  = PAGE_W - R_MARGIN
-    tot_w      = tot_right - tot_x
 
-    row_h_tot = footer_h / 3
+def _draw_totals(c, invoice):
+    """Goods Total / Freight / Invoice Total box (lower-right), baseline-aligned."""
+    top, bot = _BAND_TOP, _BAND_BOT
+    r1, r2 = 165, 125                 # internal row dividers
+    val_rx = _TOT_X + _TOT_W - 8      # values right-align here
+    lab_x  = _TOT_X + 8
 
-    # Box borders for each row
-    for i in range(3):
-        row_y = footer_top - (i + 1) * row_h_tot
-        _rect(c, tot_x, row_y, tot_w, row_h_tot,
-              stroke_color=BORDER_CLR, line_width=0.5)
+    # Invoice-total highlight (bottom row), drawn behind borders
+    _rect(c, _TOT_X, bot, _TOT_W, r2 - bot, fill=LIGHT_BLUE, stroke=None)
 
-    # Row 1 — Goods Total
-    row1_mid = footer_top - row_h_tot / 2 - 4
-    _text(c, tot_x + 6, row1_mid, "Goods Total", FONT_BOLD, 9)
-    _text_right(c, tot_right - 6, row1_mid,
-                f"{invoice.goods_total:,.2f}", FONT_MONO, 9)
+    # Box and internal rules
+    _rect(c, _TOT_X, bot, _TOT_W, top - bot, fill=None, stroke=BLACK, width=0.75)
+    _line(c, _TOT_X, r1, _TOT_X + _TOT_W, r1, width=0.6, color=HAIRLINE)
+    _line(c, _TOT_X, r2, _TOT_X + _TOT_W, r2, width=0.6, color=HAIRLINE)
 
-    # Row 2 — Freight
-    row2_mid = footer_top - row_h_tot - row_h_tot / 2 - 4
-    _text(c, tot_x + 6, row2_mid, "Freight", FONT_BOLD, 9)
-    _text_right(c, tot_right - 6, row2_mid,
-                f"{(invoice.freight or 0):,.2f}", FONT_MONO, 9)
+    # Goods Total
+    _text(c, lab_x, 182, "Goods Total", MONO_B, 9)
+    _text_right(c, val_rx, 182, f"{invoice.goods_total:,.2f}", MONO, 9)
 
-    # Row 3 — Invoice Total (dark background highlight)
-    row3_top_y = footer_bottom
-    _rect(c, tot_x, row3_top_y, tot_w, row_h_tot,
-          fill_color=DARK_BOX, stroke_color=DARK_BOX)
-    row3_mid   = footer_bottom + row_h_tot / 2 - 4
+    # Freight
+    _text(c, lab_x, 142, "Freight", MONO_B, 9)
+    _text_right(c, val_rx, 142, f"{(invoice.freight or 0):,.2f}", MONO, 9)
 
-    label_lines = [f"Invoice Total {invoice.currency or 'USD'}"]
+    # Invoice Total (caption + currency, optional delivery note, bold value)
+    cap_y = 104 if invoice.delivery_note else 99
+    _text(c, lab_x, cap_y, "Invoice Total", MONO_B, 11)
+    cur_x = lab_x + c.stringWidth("Invoice Total ", MONO_B, 11)
+    _text(c, cur_x, cap_y, invoice.currency or "USD", MONO_B, 11)
     if invoice.delivery_note:
-        label_lines.append(f"({invoice.delivery_note})")
-
-    label_y = row3_mid + 4
-    for ln in label_lines:
-        _text(c, tot_x + 6, label_y, ln, FONT_BOLD, 9, color=colors.white)
-        label_y -= 11
-
-    _text_right(c, tot_right - 6, row3_mid + 4,
-                f"{invoice.invoice_total:,.2f}", FONT_MONO_B, 11,
-                color=colors.white)
+        _text(c, lab_x, cap_y - 13, f"({invoice.delivery_note})", MONO, 8)
+    _text_right(c, val_rx, 99, f"{invoice.invoice_total:,.2f}", MONO_B, 11)
 
 
-def _draw_page_number(c, page, total_pages):
-    """Draw 'Page: X/Y' at the bottom right."""
-    _text_right(
-        c, PAGE_W - R_MARGIN,
-        L_MARGIN - 14,
-        f"Page: {page}/{total_pages}",
-        FONT_NORMAL, 8
-    )
+def _draw_footer(c, page, total_pages):
+    """Centred page-number footer with a thin separator rule."""
+    _line(c, _ITEM_X, 60, _TBL_R, 60, width=0.5, color=HAIRLINE)
+    label, value = "Page: ", f"{page}/{total_pages}"
+    total_w = (c.stringWidth(label, MONO_B, 8) + c.stringWidth(value, MONO, 8))
+    x = (PAGE_W - total_w) / 2
+    _text(c, x, 46, label, MONO_B, 8)
+    _text(c, x + c.stringWidth(label, MONO_B, 8), 46, value, MONO, 8)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -406,33 +329,15 @@ def generate_invoice_pdf(invoice, settings: dict, logo_path: str = None) -> byte
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
 
-    # ── Draw header ──────────────────────────────────────────────────────
-    y = _draw_header(c, settings, logo_path)
-    y -= 6
-
-    # ── Invoice bar ──────────────────────────────────────────────────────
-    y = _draw_invoice_bar(c, invoice.invoice_number, invoice.invoice_date, y)
-
-    # ── Customer block ───────────────────────────────────────────────────
-    y -= 8
-    y = _draw_customer(c, invoice.customer, invoice.customer_type, y)
-
-    # ── Details grid ─────────────────────────────────────────────────────
-    y -= 6
-    y = _draw_details_grid(c, invoice, y)
-
-    # ── Items table ──────────────────────────────────────────────────────
-    y = _draw_items_table(c, invoice.line_items, y)
-
-    # ── Notes ────────────────────────────────────────────────────────────
-    y = _draw_notes(c, invoice.notes, y)
-
-    # ── Footer — always pinned to the bottom ─────────────────────────────
-    footer_top = 40 + 120 + 10   # bottom margin + footer height + padding
-    _draw_footer(c, invoice, settings, footer_top)
-
-    # ── Page number ──────────────────────────────────────────────────────
-    _draw_page_number(c, 1, 1)
+    _draw_header(c, settings, logo_path)
+    _draw_invoice_bar(c, invoice.invoice_number, invoice.invoice_date)
+    _draw_customer(c, invoice.customer, invoice.customer_type)
+    _draw_details_grid(c, invoice)
+    _draw_items_table(c, invoice.line_items)
+    _draw_notes(c, invoice.notes)
+    _draw_bank_box(c, settings)
+    _draw_totals(c, invoice)
+    _draw_footer(c, 1, 1)
 
     c.save()
     return buffer.getvalue()
